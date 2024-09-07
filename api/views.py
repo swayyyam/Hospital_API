@@ -1,16 +1,20 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from django.contrib.auth.models import User
+from django.contrib.auth.models import User, Group
 from rest_framework import status
-from rest_framework.authtoken.models import Token
-from django.contrib.auth.models import Group
+from oauth2_provider.contrib.rest_framework import OAuth2Authentication
 from .models import Department, PatientRecord
-from .serializers import DepartmentSerializer, PatientRecordSerializer
-from rest_framework.decorators import api_view, permission_classes
+from .serializers import PatientRecordSerializer
 from oauth2_provider.models import AccessToken
 from django.utils import timezone
+from oauth2_provider.settings import oauth2_settings
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import BasePermission
+import logging
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 
 class CanViewOwnRecords(BasePermission):
@@ -25,17 +29,13 @@ class CanViewModifyDepartmentRecords(BasePermission):
 
 
 class DoctorListView(APIView):
+    authentication_classes = [OAuth2Authentication]
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         if request.user.groups.filter(name='Doctors').exists():
             doctors = User.objects.filter(groups__name='Doctors').values('id', 'username')
             return Response(doctors, status=status.HTTP_200_OK)
-        return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
-
-    def post(self, request):
-        if request.user.groups.filter(name='Doctors').exists():
-            return Response({"detail": "Doctor added"}, status=status.HTTP_201_CREATED)
         return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
 
 @api_view(['GET', 'PUT', 'DELETE'])
@@ -93,35 +93,45 @@ def patient_detail(request, pk):
         return Response({"detail": "Patient deleted"}, status=status.HTTP_204_NO_CONTENT)
 
 class PatientRecordListView(APIView):
+    authentication_classes = [OAuth2Authentication]
     permission_classes = [IsAuthenticated, CanViewOwnRecords | CanViewModifyDepartmentRecords]
 
     def get(self, request):
+        logger.info(f"Headers: {request.headers}")
+        logger.info(f"User: {request.user}")
+        logger.info(f"Auth: {request.auth}")
+
         if request.user.groups.filter(name='Doctors').exists():
-            # If user is a doctor, fetch records for patients in their department
-            records = PatientRecord.objects.filter(department__in=request.user.department_set.all())
-        else:
-            # If user is a patient, fetch only their own records
-            records = PatientRecord.objects.filter(patient=request.user)
+            # Retrieve patient records, but only those whose patients are in the "Patients" group
+            records = PatientRecord.objects.filter(department__in=request.user.department_set.all(), patient__groups__name='Patients')
+            return Response(records.values(), status=status.HTTP_200_OK)
         
-        return Response(records.values(), status=status.HTTP_200_OK)
+        return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
 
     def post(self, request):
-        # Only allow doctors to create records
         if request.user.groups.filter(name='Doctors').exists():
-            # Create patient record logic goes here
-            return Response({"detail": "Patient record created"}, status=status.HTTP_201_CREATED)
+            # Ensure the user associated with the record is in the Patients group
+            patient_id = request.data.get('patient')
+            try:
+                patient = User.objects.get(id=patient_id, groups__name='Patients')
+                # Proceed with record creation (Omitted for brevity)
+                return Response({"detail": "Patient record created"}, status=status.HTTP_201_CREATED)
+            except User.DoesNotExist:
+                return Response({"detail": "Invalid patient. Ensure the user belongs to the Patients group."}, status=status.HTTP_400_BAD_REQUEST)
+
         return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
+
 
 @api_view(['GET', 'PUT', 'DELETE'])
 @permission_classes([IsAuthenticated, CanViewOwnRecords | CanViewModifyDepartmentRecords])
 def patient_record_detail(request, pk):
     try:
-        record = PatientRecord.objects.get(pk=pk)
+        record = PatientRecord.objects.get(pk=pk, patient__groups__name='Patients')  # Ensure patient belongs to the Patients group
     except PatientRecord.DoesNotExist:
-        return Response({"detail": "Record not found"}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"detail": "Record not found or invalid patient group."}, status=status.HTTP_404_NOT_FOUND)
 
-    # Patients can only see their own records
     if request.user == record.patient:
+        # Return record if the user is the patient
         if request.method == 'GET':
             return Response({
                 'record_id': record.record_id,
@@ -133,33 +143,32 @@ def patient_record_detail(request, pk):
                 'created_date': record.created_date
             }, status=status.HTTP_200_OK)
 
-    # Doctors can view and modify records of patients in their department
-    elif request.user.groups.filter(name='Doctors').exists():
-        if record.department in request.user.department_set.all():
-            if request.method == 'GET':
-                return Response({
-                    'record_id': record.record_id,
-                    'patient': record.patient.username,
-                    'diagnostics': record.diagnostics,
-                    'observations': record.observations,
-                    'treatments': record.treatments,
-                    'department': record.department.name,
-                    'created_date': record.created_date
-                }, status=status.HTTP_200_OK)
+    # Doctors can view and modify their department's patients' records
+    elif request.user.groups.filter(name='Doctors').exists() and record.department in request.user.department_set.all():
+        if request.method == 'GET':
+            return Response({
+                'record_id': record.record_id,
+                'patient': record.patient.username,
+                'diagnostics': record.diagnostics,
+                'observations': record.observations,
+                'treatments': record.treatments,
+                'department': record.department.name,
+                'created_date': record.created_date
+            }, status=status.HTTP_200_OK)
 
-            if request.method == 'PUT':
-                # Modify record logic goes here (e.g., update diagnostics, observations, etc.)
-                record.diagnostics = request.data.get('diagnostics', record.diagnostics)
-                record.observations = request.data.get('observations', record.observations)
-                record.treatments = request.data.get('treatments', record.treatments)
-                record.save()
-                return Response({"detail": "Record updated"}, status=status.HTTP_200_OK)
+        if request.method == 'PUT':
+            record.diagnostics = request.data.get('diagnostics', record.diagnostics)
+            record.observations = request.data.get('observations', record.observations)
+            record.treatments = request.data.get('treatments', record.treatments)
+            record.save()
+            return Response({"detail": "Record updated"}, status=status.HTTP_200_OK)
 
-            if request.method == 'DELETE':
-                record.delete()
-                return Response({"detail": "Record deleted"}, status=status.HTTP_204_NO_CONTENT)
+        if request.method == 'DELETE':
+            record.delete()
+            return Response({"detail": "Record deleted"}, status=status.HTTP_204_NO_CONTENT)
 
     return Response({"detail": "Not authorized"}, status=status.HTTP_403_FORBIDDEN)
+
 
 class DepartmentListView(APIView):
     def get(self, request):
@@ -204,41 +213,54 @@ class DepartmentPatientsView(APIView):
 def register(request):
     username = request.data.get('username')
     password = request.data.get('password')
-    group_type = request.data.get('group')  
+    group_type = request.data.get('group')
 
-    if username is None or password is None or group_type is None:
+    if not username or not password or not group_type:
         return Response({'detail': 'Please provide username, password, and group.'}, status=status.HTTP_400_BAD_REQUEST)
-    
+
     if User.objects.filter(username=username).exists():
         return Response({'detail': 'Username already taken.'}, status=status.HTTP_400_BAD_REQUEST)
 
-   
     user = User.objects.create_user(username=username, password=password)
-    
     if group_type.lower() == 'doctor':
-        doctors_group = Group.objects.get(name='Doctors')
-        user.groups.add(doctors_group)
+        group = Group.objects.get(name='Doctors')
     elif group_type.lower() == 'patient':
-        patients_group = Group.objects.get(name='Patients')
-        user.groups.add(patients_group)
+        group = Group.objects.get(name='Patients')
     else:
         return Response({'detail': 'Invalid group. Please choose either Doctor or Patient.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    user.groups.add(group)
     user.save()
 
-    token, created = Token.objects.get_or_create(user=user)
-    return Response({'token': token.key, 'username': username, 'group': group_type}, status=status.HTTP_201_CREATED)
+    return Response({'username': username, 'group': group_type}, status=status.HTTP_201_CREATED)
 
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def logout_view(request):
-    try:
-        token = AccessToken.objects.get(user=request.user)
-        token.expires = timezone.now()
-        token.save()
-    except AccessToken.DoesNotExist:
-        pass
+    """
+    Log out a user by revoking their access token and marking it as expired.
+    """
+    # Get the token from the Authorization header
+    auth_header = request.headers.get('Authorization')
     
-    return Response({'detail': 'Successfully logged out.'}, status=status.HTTP_200_OK)
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return Response({'detail': 'No valid token provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Extract the token string
+    token_str = auth_header.split(' ')[1]
+
+    try:
+        # Retrieve the access token
+        token = AccessToken.objects.get(token=token_str)
+        token.expires = timezone.now()  # Mark token as expired
+        token.save()
+
+        # Optionally, you could also delete or revoke the token
+        oauth2_settings.ACCESS_TOKEN_MODEL.objects.filter(token=token_str).delete()
+
+        return Response({'detail': 'Successfully logged out.'}, status=status.HTTP_200_OK)
+
+    except AccessToken.DoesNotExist:
+        return Response({'detail': 'Token not found or already expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
