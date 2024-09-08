@@ -13,7 +13,6 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import BasePermission
 import logging
 
-# Set up logging
 logger = logging.getLogger(__name__)
 
 
@@ -102,7 +101,6 @@ class PatientRecordListView(APIView):
         logger.info(f"Auth: {request.auth}")
 
         if request.user.groups.filter(name='Doctors').exists():
-            # Retrieve patient records, but only those whose patients are in the "Patients" group
             records = PatientRecord.objects.filter(department__in=request.user.department_set.all(), patient__groups__name='Patients')
             return Response(records.values(), status=status.HTTP_200_OK)
         
@@ -110,11 +108,11 @@ class PatientRecordListView(APIView):
 
     def post(self, request):
         if request.user.groups.filter(name='Doctors').exists():
-            # Ensure the user associated with the record is in the Patients group
+            
             patient_id = request.data.get('patient')
             try:
                 patient = User.objects.get(id=patient_id, groups__name='Patients')
-                # Proceed with record creation (Omitted for brevity)
+                
                 return Response({"detail": "Patient record created"}, status=status.HTTP_201_CREATED)
             except User.DoesNotExist:
                 return Response({"detail": "Invalid patient. Ensure the user belongs to the Patients group."}, status=status.HTTP_400_BAD_REQUEST)
@@ -126,12 +124,12 @@ class PatientRecordListView(APIView):
 @permission_classes([IsAuthenticated, CanViewOwnRecords | CanViewModifyDepartmentRecords])
 def patient_record_detail(request, pk):
     try:
-        record = PatientRecord.objects.get(pk=pk, patient__groups__name='Patients')  # Ensure patient belongs to the Patients group
+        record = PatientRecord.objects.get(pk=pk, patient__groups__name='Patients')  
     except PatientRecord.DoesNotExist:
         return Response({"detail": "Record not found or invalid patient group."}, status=status.HTTP_404_NOT_FOUND)
 
     if request.user == record.patient:
-        # Return record if the user is the patient
+        
         if request.method == 'GET':
             return Response({
                 'record_id': record.record_id,
@@ -143,7 +141,7 @@ def patient_record_detail(request, pk):
                 'created_date': record.created_date
             }, status=status.HTTP_200_OK)
 
-    # Doctors can view and modify their department's patients' records
+    
     elif request.user.groups.filter(name='Doctors').exists() and record.department in request.user.department_set.all():
         if request.method == 'GET':
             return Response({
@@ -238,25 +236,19 @@ def register(request):
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def logout_view(request):
-    """
-    Log out a user by revoking their access token and marking it as expired.
-    """
-    # Get the token from the Authorization header
     auth_header = request.headers.get('Authorization')
     
     if not auth_header or not auth_header.startswith('Bearer '):
         return Response({'detail': 'No valid token provided.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Extract the token string
     token_str = auth_header.split(' ')[1]
 
     try:
-        # Retrieve the access token
+
         token = AccessToken.objects.get(token=token_str)
-        token.expires = timezone.now()  # Mark token as expired
+        token.expires = timezone.now()  
         token.save()
 
-        # Optionally, you could also delete or revoke the token
         oauth2_settings.ACCESS_TOKEN_MODEL.objects.filter(token=token_str).delete()
 
         return Response({'detail': 'Successfully logged out.'}, status=status.HTTP_200_OK)
