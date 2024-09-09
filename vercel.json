@@ -23,9 +23,14 @@
         "dest": "/static/$1"
       },
       {
+        "src": "/api/(.*)",
+        "dest": "/hospital_management/wsgi.py"
+      },
+      {
         "src": "/(.*)",
-        "dest": "hospital_management/wsgi.py"
+        "dest": "/staticfiles_build/$1"
       }
     ]
   }
+  
   
